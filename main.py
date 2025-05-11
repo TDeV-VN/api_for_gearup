@@ -3,7 +3,7 @@
 
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, HttpUrl
 import firebase_admin
 from firebase_admin import credentials, auth
 import datetime
@@ -13,6 +13,7 @@ import os
 import redis
 import yagmail
 from dotenv import load_dotenv
+from typing import List, Optional, Any
 
 # --- Cấu hình và Khởi tạo ---
 load_dotenv() # Tải các biến từ file .env
@@ -74,6 +75,34 @@ class VerifyOtpRequest(BaseModel):
     email: EmailStr
     otp: str
 
+# --- Pydantic Models cho Quản lý Người dùng ---
+
+class UserResponse(BaseModel):
+    uid: str
+    email: Optional[EmailStr] = None
+    displayName: Optional[str] = None
+    disabled: bool
+    photoURL: Optional[HttpUrl] = None # Sử dụng HttpUrl cho validation tốt hơn
+    # Thêm các trường khác nếu cần, ví dụ: emailVerified, metadata (creationTime, lastSignInTime)
+    # emailVerified: bool
+    # creationTime: Optional[str] = None # Firebase trả về dạng string, có thể cần parse
+    # lastSignInTime: Optional[str] = None
+
+class UserListResponse(BaseModel):
+    users: List[UserResponse]
+    nextPageToken: Optional[str] = None
+
+class UserUpdateRequest(BaseModel):
+    displayName: Optional[str] = None
+    email: Optional[EmailStr] = None
+    password: Optional[str] = None # Mật khẩu nên được hash ở client hoặc có yêu cầu độ mạnh
+    photoURL: Optional[HttpUrl] = None
+    disabled: Optional[bool] = None # Cũng có thể dùng cho cấm/hủy cấm
+    emailVerified: Optional[bool] = None # Cho phép admin xác minh email nếu cần
+
+class UserBanStatusRequest(BaseModel):
+    disabled: bool
+
 # --- Hằng số ---
 OTP_EXPIRY_SECONDS = 10 * 60  # OTP hết hạn sau 10 phút (600 giây)
 REDIS_OTP_PREFIX = "otp_reset:" # Tiền tố cho key OTP trong Redis
@@ -104,7 +133,7 @@ async def send_email_with_otp_gmail(email_to: str, otp: str):
         print(f"Lỗi khi gửi email OTP tới {email_to}: {e}")
         return False
 
-# --- API Endpoints ---
+# --- API Endpoints cho quên mật khẩu ---
 
 @app.post("/request-password-otp-and-code", status_code=status.HTTP_200_OK)
 async def request_password_otp_and_code(request: EmailRequest):
@@ -196,3 +225,107 @@ async def verify_otp_and_get_code(request: VerifyOtpRequest):
 
     print(f"OTP cho {email} đã được xác thực. Trả về oobCode.")
     return {"message": "OTP xác thực thành công.", "oobCode": oob_code_to_return}
+
+
+
+# --- API Endpoints cho Quản lý Người dùng ---
+
+@app.get("/users", response_model=UserListResponse, summary="Lấy danh sách người dùng")
+async def list_all_users(page_token: Optional[str] = None, max_results: int = 100):
+    """
+    Lấy danh sách người dùng với phân trang.
+    - `page_token`: Token để lấy trang tiếp theo.
+    - `max_results`: Số lượng người dùng tối đa mỗi trang (mặc định và tối đa của Firebase là 1000).
+    """
+    try:
+        # Giới hạn max_results để tránh quá tải, Firebase có giới hạn riêng là 1000
+        if max_results > 1000:
+            max_results = 1000
+            
+        page = auth.list_users(page_token=page_token, max_results=max_results)
+        users_data = [
+            UserResponse(
+                uid=user.uid,
+                email=user.email,
+                displayName=user.display_name,
+                disabled=user.disabled,
+                photoURL=user.photo_url if user.photo_url else None, # Xử lý nếu photo_url là None
+                # emailVerified=user.email_verified,
+                # creationTime=user.user_metadata.creation_timestamp if user.user_metadata else None, # Cần parse timestamp
+                # lastSignInTime=user.user_metadata.last_sign_in_timestamp if user.user_metadata else None,
+            )
+            for user in page.users
+        ]
+        return UserListResponse(users=users_data, nextPageToken=page.next_page_token)
+    except Exception as e:
+        print(f"Lỗi khi lấy danh sách người dùng: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Lỗi máy chủ khi lấy danh sách người dùng.")
+
+
+@app.put("/users/{user_uid}/status", response_model=UserResponse, summary="Cấm hoặc hủy cấm người dùng")
+async def set_user_ban_status(user_uid: str, request: UserBanStatusRequest):
+    """
+    Cập nhật trạng thái cấm (disabled) của một người dùng.
+    - `user_uid`: UID của người dùng cần cập nhật.
+    - `request.disabled`: `true` để cấm, `false` để hủy cấm.
+    """
+    try:
+        updated_user_record = auth.update_user(user_uid, disabled=request.disabled)
+        return UserResponse(
+            uid=updated_user_record.uid,
+            email=updated_user_record.email,
+            displayName=updated_user_record.display_name,
+            disabled=updated_user_record.disabled,
+            photoURL=updated_user_record.photo_url if updated_user_record.photo_url else None
+        )
+    except auth.UserNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Không tìm thấy người dùng với UID: {user_uid}")
+    except Exception as e:
+        print(f"Lỗi khi cập nhật trạng thái cấm của người dùng {user_uid}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Lỗi máy chủ khi cập nhật trạng thái người dùng.")
+
+
+@app.put("/users/{user_uid}", response_model=UserResponse, summary="Cập nhật thông tin người dùng")
+async def update_user_info(user_uid: str, request: UserUpdateRequest):
+    """
+    Cập nhật thông tin cho một người dùng cụ thể.
+    Chỉ các trường được cung cấp trong request body mới được cập nhật.
+    """
+    update_payload: Dict[str, Any] = {}
+    if request.displayName is not None:
+        update_payload["display_name"] = request.displayName
+    if request.email is not None:
+        update_payload["email"] = request.email
+        # Khi cập nhật email qua Admin SDK, emailVerified tự động thành False
+        # Bạn có thể set emailVerified thành True nếu muốn xác minh ngay
+        # update_payload["email_verified"] = False # Mặc định của Firebase
+    if request.password is not None:
+        if len(request.password) < 6: # Firebase yêu cầu mật khẩu ít nhất 6 ký tự
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Mật khẩu phải có ít nhất 6 ký tự.")
+        update_payload["password"] = request.password
+    if request.photoURL is not None:
+        update_payload["photo_url"] = str(request.photoURL) # Chuyển HttpUrl thành string
+    if request.disabled is not None: # Cũng có thể dùng endpoint /status riêng
+        update_payload["disabled"] = request.disabled
+    if request.emailVerified is not None: # Cho phép admin set emailVerified
+        update_payload["email_verified"] = request.emailVerified
+
+    if not update_payload:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Không có thông tin nào được cung cấp để cập nhật.")
+
+    try:
+        updated_user_record = auth.update_user(user_uid, **update_payload)
+        return UserResponse(
+            uid=updated_user_record.uid,
+            email=updated_user_record.email,
+            displayName=updated_user_record.display_name,
+            disabled=updated_user_record.disabled,
+            photoURL=updated_user_record.photo_url if updated_user_record.photo_url else None
+        )
+    except auth.UserNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Không tìm thấy người dùng với UID: {user_uid}")
+    except auth.EmailAlreadyExistsError: # Nếu email mới đã được sử dụng
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Địa chỉ email mới đã được sử dụng bởi tài khoản khác.")
+    except Exception as e:
+        print(f"Lỗi khi cập nhật thông tin người dùng {user_uid}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Lỗi máy chủ khi cập nhật thông tin người dùng.")
